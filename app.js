@@ -9,24 +9,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Caminho onde o yt-dlp será armazenado
 const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 
-// Função para baixar o yt-dlp mais recente
+// Baixa o yt-dlp
 function downloadYtDlp() {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(YTDLP_PATH);
     const url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
-    
     https.get(url, (response) => {
       if (response.statusCode === 302 || response.statusCode === 301) {
-        // Segue o redirect
         https.get(response.headers.location, (redirectRes) => {
           redirectRes.pipe(file);
           file.on('finish', () => {
             file.close();
-            fs.chmodSync(YTDLP_PATH, '755'); // Torna executável
-            console.log('yt-dlp baixado com sucesso');
+            fs.chmodSync(YTDLP_PATH, '755');
+            console.log('yt-dlp baixado');
             resolve();
           });
         }).on('error', reject);
@@ -35,7 +32,7 @@ function downloadYtDlp() {
         file.on('finish', () => {
           file.close();
           fs.chmodSync(YTDLP_PATH, '755');
-          console.log('yt-dlp baixado com sucesso');
+          console.log('yt-dlp baixado');
           resolve();
         });
       }
@@ -43,13 +40,14 @@ function downloadYtDlp() {
   });
 }
 
-// Função para executar o yt-dlp
-function execYtDlp(args) {
+// Executa yt-dlp com timeout e captura de erros
+function execYtDlp(args, timeout = 60000) {
   return new Promise((resolve, reject) => {
     const cmd = `${YTDLP_PATH} ${args.join(' ')}`;
-    exec(cmd, { timeout: 30000 }, (error, stdout, stderr) => {
+    exec(cmd, { timeout, maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
       if (error) {
-        reject(error);
+        // Rejeita com detalhes do stderr
+        reject(new Error(stderr || error.message));
       } else {
         resolve(stdout.trim());
       }
@@ -58,29 +56,35 @@ function execYtDlp(args) {
 }
 
 // Rota de health check
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    message: 'Vidown API (yt-dlp) is running',
-    ytdlp_exists: fs.existsSync(YTDLP_PATH)
+app.get('/', async (req, res) => {
+  const exists = fs.existsSync(YTDLP_PATH);
+  let version = null;
+  if (exists) {
+    try {
+      version = await execYtDlp(['--version'], 10000);
+    } catch (e) {
+      version = 'error: ' + e.message;
+    }
+  }
+  res.json({
+    status: 'ok',
+    ytdlp_exists: exists,
+    ytdlp_version: version,
+    message: 'Vidown API (yt-dlp) is running'
   });
 });
 
-// Endpoint de informações do vídeo
-app.post('/info', async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ status: 'error', text: 'URL is required' });
-
+// Endpoint de teste rápido
+app.get('/test', async (req, res) => {
   try {
-    const output = await execYtDlp(['--dump-json', '--no-playlist', url]);
-    const info = JSON.parse(output);
-    res.json({ status: 'ok', title: info.title, duration: info.duration });
-  } catch (error) {
-    res.status(500).json({ status: 'error', text: 'Failed to get video info' });
+    const output = await execYtDlp(['--version'], 10000);
+    res.json({ status: 'ok', version: output });
+  } catch (e) {
+    res.status(500).json({ status: 'error', text: e.message });
   }
 });
 
-// Endpoint principal de download
+// Endpoint de download
 app.post('/download', async (req, res) => {
   const { url, isAudioOnly, quality } = req.body;
 
@@ -89,28 +93,51 @@ app.post('/download', async (req, res) => {
   }
 
   try {
-    // Primeiro obtém informações do vídeo
-    const infoOutput = await execYtDlp(['--dump-json', '--no-playlist', url]);
+    // Primeiro tenta obter informações (já valida se o vídeo existe)
+    const infoOutput = await execYtDlp([
+      '--dump-json',
+      '--no-playlist',
+      '--no-check-certificates',
+      '--geo-bypass',
+      url
+    ]);
     const info = JSON.parse(infoOutput);
     const title = info.title || 'video';
 
-    // Define o formato
+    // Define o formato com fallback
     let formatArg;
     if (isAudioOnly) {
       formatArg = 'bestaudio[ext=m4a]/bestaudio/best';
     } else {
       const height = quality || 1080;
+      // Tenta o formato específico, depois o best geral
       formatArg = `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`;
     }
 
-    // Obtém a URL do stream (usando -g para retornar apenas URL)
-    const streamUrl = await execYtDlp([
-      '-f', formatArg,
-      '-g',
-      '--no-playlist',
-      '--no-check-certificates',
-      url
-    ]);
+    let streamUrl;
+    try {
+      streamUrl = await execYtDlp([
+        '-f', formatArg,
+        '-g',
+        '--no-playlist',
+        '--no-check-certificates',
+        '--geo-bypass',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        url
+      ]);
+    } catch (formatError) {
+      // Se falhar com o formato específico, tenta com best
+      console.warn('Formato específico falhou, tentando best...');
+      streamUrl = await execYtDlp([
+        '-f', 'best',
+        '-g',
+        '--no-playlist',
+        '--no-check-certificates',
+        '--geo-bypass',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        url
+      ]);
+    }
 
     res.json({
       status: 'stream',
@@ -119,15 +146,15 @@ app.post('/download', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Download error:', error);
+    console.error('Erro completo:', error);
     res.status(500).json({
       status: 'error',
-      text: 'Failed to process video. Please try again later.'
+      text: 'Failed to process video. ' + error.message.slice(0, 300)
     });
   }
 });
 
-// Inicializa o servidor e baixa o yt-dlp
+// Inicialização
 const PORT = process.env.PORT || 3000;
 
 async function start() {
