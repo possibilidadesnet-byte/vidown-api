@@ -141,6 +141,11 @@ app.post('/download', async (req, res) => {
       url
     ]);
 
+    // Verificação extra: se a URL retornada parece ser uma página HTML, rejeita
+    if (streamUrl.includes('youtube.com') || streamUrl.includes('.html') || streamUrl.includes('accounts.google.com')) {
+      throw new Error('URL retornada não é um stream de mídia: ' + streamUrl.slice(0, 200));
+    }
+
     res.json({ status: 'stream', url: streamUrl, title: title });
 
   } catch (error) {
