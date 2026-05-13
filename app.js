@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
@@ -40,19 +40,39 @@ function downloadYtDlp() {
   });
 }
 
-// Executa comando yt-dlp
+// Executa yt-dlp com spawn (SEM shell)
 function execYtDlp(args, timeout = 120000) {
   return new Promise((resolve, reject) => {
-    const cmd = `${YTDLP_PATH} ${args.join(' ')}`;
-    console.log('▶️', cmd);
-    exec(cmd, { timeout, maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
-      if (error) {
-        console.error('❌ stderr:', stderr);
-        reject(new Error(stderr || error.message));
+    console.log('▶️', YTDLP_PATH, args.join(' '));
+    const child = spawn(YTDLP_PATH, args, {
+      timeout,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        console.error('❌ exit code', code);
+        console.error('stderr:', stderr);
+        reject(new Error(stderr || `Process exited with code ${code}`));
       } else {
         console.log('✅ stdout (primeiros 150 chars):', stdout.slice(0, 150));
         resolve(stdout.trim());
       }
+    });
+
+    child.on('error', (err) => {
+      reject(err);
     });
   });
 }
@@ -74,7 +94,6 @@ app.get('/debug', async (req, res) => {
       '--print', 'title',
       '--no-playlist',
       '--no-check-certificates',
-      '--geo-bypass',
       'https://www.youtube.com/watch?v=aqz-KE-bpBQ'
     ]);
     res.json({ status: 'ok', title: stdout });
@@ -94,20 +113,19 @@ app.post('/download', async (req, res) => {
     if (isAudioOnly) {
       format = 'bestaudio[ext=m4a]/bestaudio/best';
     } else if (quality && quality !== 'max') {
-      // Tenta altura específica, com fallback automático para best
       format = `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`;
     }
 
     // Obtém título
     let title = 'video';
     try {
-      const infoOutput = await execYtDlp([
+      const titleOutput = await execYtDlp([
         '--print', 'title',
         '--no-playlist',
         '--no-check-certificates',
         url
       ]);
-      title = infoOutput || title;
+      title = titleOutput || title;
     } catch (infoErr) {
       console.warn('⚠️ Não foi possível obter título:', infoErr.message);
     }
