@@ -1,12 +1,13 @@
 const express = require('express');
 const cors = require('cors');
-const { YtDlp } = require('yt-dlp-wrap');
+const YtDlpWrap = require('yt-dlp-wrap').default;
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
-const ytDlp = new YtDlp();
+// Instancia com o caminho padrão (yt-dlp será baixado automaticamente)
+const ytDlpWrap = new YtDlpWrap();
 
 // Rota de health check
 app.get('/', (req, res) => {
@@ -23,7 +24,7 @@ app.post('/download', async (req, res) => {
 
   try {
     // Busca informações do vídeo
-    const info = await ytDlp.getVideoInfo(url);
+    const info = await ytDlpWrap.getVideoInfo(url);
     const title = info.title || 'video';
 
     // Define o formato com base na qualidade e tipo
@@ -36,7 +37,7 @@ app.post('/download', async (req, res) => {
     }
 
     // Obtém a URL do stream
-    const streamUrl = await ytDlp.execPromise([
+    const streamUrl = await ytDlpWrap.execPromise([
       url,
       '-f', format,
       '-g', // retorna apenas a URL
