@@ -40,75 +40,31 @@ function downloadYtDlp() {
   });
 }
 
-// Executa yt-dlp com spawn (SEM shell)
-function execYtDlp(args, timeout = 120000) {
-  return new Promise((resolve, reject) => {
-    console.log('▶️', YTDLP_PATH, args.join(' '));
-    const child = spawn(YTDLP_PATH, args, {
-      timeout,
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-
-    child.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-
-    child.on('close', (code) => {
-      if (code !== 0) {
-        console.error('❌ exit code', code);
-        console.error('stderr:', stderr);
-        reject(new Error(stderr || `Process exited with code ${code}`));
-      } else {
-        console.log('✅ stdout (primeiros 150 chars):', stdout.slice(0, 150));
-        resolve(stdout.trim());
-      }
-    });
-
-    child.on('error', (err) => {
-      reject(err);
-    });
-  });
-}
-
 // Health check
 app.get('/', async (req, res) => {
   const exists = fs.existsSync(YTDLP_PATH);
   let version = null;
   if (exists) {
-    try { version = await execYtDlp(['--version'], 10000); } catch (e) { version = 'error'; }
+    try {
+      version = await new Promise((resolve, reject) => {
+        const child = spawn(YTDLP_PATH, ['--version'], { timeout: 10000 });
+        let out = '';
+        child.stdout.on('data', d => out += d);
+        child.on('close', () => resolve(out.trim()));
+        child.on('error', reject);
+      });
+    } catch (e) { version = 'error'; }
   }
   res.json({ status: 'ok', ytdlp_exists: exists, ytdlp_version: version });
 });
 
-// Debug: testa extração de título
-app.get('/debug', async (req, res) => {
-  try {
-    const stdout = await execYtDlp([
-      '--print', 'title',
-      '--no-playlist',
-      '--no-check-certificates',
-      'https://www.youtube.com/watch?v=aqz-KE-bpBQ'
-    ]);
-    res.json({ status: 'ok', title: stdout });
-  } catch (e) {
-    res.status(500).json({ status: 'error', detail: e.message });
-  }
-});
-
-// Endpoint de download
+// Endpoint de download → stream do arquivo
 app.post('/download', async (req, res) => {
   const { url, isAudioOnly, quality } = req.body;
   if (!url) return res.status(400).json({ status: 'error', text: 'URL is required' });
 
   try {
-    // Define formato – prioriza o 'best' que é universal e estável
+    // Define formato
     let format = 'best';
     if (isAudioOnly) {
       format = 'bestaudio[ext=m4a]/bestaudio/best';
@@ -116,45 +72,87 @@ app.post('/download', async (req, res) => {
       format = `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`;
     }
 
-    // Obtém título
+    // Obtém título para o nome do arquivo
     let title = 'video';
     try {
-      const titleOutput = await execYtDlp([
-        '--print', 'title',
-        '--no-playlist',
-        '--no-check-certificates',
-        url
-      ]);
-      title = titleOutput || title;
-    } catch (infoErr) {
-      console.warn('⚠️ Não foi possível obter título:', infoErr.message);
+      title = await new Promise((resolve, reject) => {
+        const child = spawn(YTDLP_PATH, [
+          '--print', 'title',
+          '--no-playlist',
+          '--no-check-certificates',
+          url
+        ], { timeout: 30000 });
+        let out = '';
+        child.stdout.on('data', d => out += d);
+        child.on('close', () => resolve(out.trim()));
+        child.on('error', reject);
+      });
+      title = title || 'video';
+      // Remove caracteres inválidos para nome de arquivo
+      title = title.replace(/[\\/:*?"<>|]/g, '_').substring(0, 100);
+    } catch (e) {
+      console.warn('⚠️ Título não obtido, usando padrão');
     }
 
-    // Obtém URL do stream (apenas a URL com -g)
-    const streamUrl = await execYtDlp([
+    const ext = isAudioOnly ? '.mp3' : '.mp4';
+    const filename = encodeURIComponent(title + ext);
+
+    // Define os argumentos do yt-dlp: download para stdout (-o -)
+    const args = [
       '-f', format,
-      '-g',
+      '-o', '-',          // envia para stdout
       '--no-playlist',
       '--no-check-certificates',
       '--geo-bypass',
       '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       url
-    ]);
+    ];
 
-    // Verificação extra: se a URL retornada parece ser uma página HTML, rejeita
-    if (streamUrl.includes('youtube.com') || streamUrl.includes('.html') || streamUrl.includes('accounts.google.com')) {
-      throw new Error('URL retornada não é um stream de mídia: ' + streamUrl.slice(0, 200));
-    }
+    console.log('▶️ Baixando:', url, 'Formato:', format);
 
-    res.json({ status: 'stream', url: streamUrl, title: title });
+    // Spawn do processo
+    const child = spawn(YTDLP_PATH, args, {
+      timeout: 300000, // 5 minutos
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    // Configura cabeçalhos da resposta
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${filename}`);
+    res.setHeader('Content-Type', isAudioOnly ? 'audio/mpeg' : 'video/mp4');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    // Pipe do stdout do yt-dlp para a resposta HTTP
+    child.stdout.pipe(res);
+
+    // Tratamento de erros
+    child.stderr.on('data', (data) => {
+      console.error('yt-dlp stderr:', data.toString());
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        console.error('❌ yt-dlp finalizou com código', code);
+        // Se ainda não enviou cabeçalhos, retorna erro
+        if (!res.headersSent) {
+          res.status(500).json({ status: 'error', text: 'Download failed' });
+        }
+      } else {
+        console.log('✅ Download concluído');
+      }
+    });
+
+    child.on('error', (err) => {
+      console.error('❌ Erro ao spawn yt-dlp:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ status: 'error', text: 'Internal error' });
+      }
+    });
 
   } catch (error) {
-    console.error('❌ Download error:', error);
-    res.status(500).json({
-      status: 'error',
-      text: 'Failed to process video.',
-      detail: error.message.slice(0, 500)
-    });
+    console.error('❌ Erro no endpoint /download:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ status: 'error', text: 'Failed to process video.' });
+    }
   }
 });
 
