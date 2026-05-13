@@ -11,7 +11,9 @@ app.use(express.json());
 
 const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 
-// Baixa o yt-dlp
+// ------------------------------------------------------------
+// BAIXAR O YT-DLP (caso não exista)
+// ------------------------------------------------------------
 function downloadYtDlp() {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(YTDLP_PATH);
@@ -23,7 +25,7 @@ function downloadYtDlp() {
           file.on('finish', () => {
             file.close();
             fs.chmodSync(YTDLP_PATH, '755');
-            console.log('yt-dlp baixado');
+            console.log('✅ yt-dlp baixado com sucesso');
             resolve();
           });
         }).on('error', reject);
@@ -32,7 +34,7 @@ function downloadYtDlp() {
         file.on('finish', () => {
           file.close();
           fs.chmodSync(YTDLP_PATH, '755');
-          console.log('yt-dlp baixado');
+          console.log('✅ yt-dlp baixado com sucesso');
           resolve();
         });
       }
@@ -40,51 +42,55 @@ function downloadYtDlp() {
   });
 }
 
-// Executa yt-dlp com timeout e captura de erros
-function execYtDlp(args, timeout = 60000) {
+// ------------------------------------------------------------
+// EXECUTAR O YT-DLP (captura tudo)
+// ------------------------------------------------------------
+function execYtDlp(args, timeout = 90000) {
   return new Promise((resolve, reject) => {
     const cmd = `${YTDLP_PATH} ${args.join(' ')}`;
-    exec(cmd, { timeout, maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
+    console.log('▶️ Executando:', cmd);
+    exec(cmd, { timeout, maxBuffer: 1024 * 1024 * 10 }, (error, stdout, stderr) => {
       if (error) {
-        // Rejeita com detalhes do stderr
-        reject(new Error(stderr || error.message));
+        console.error('❌ Erro exec:', error.message);
+        console.error('stderr:', stderr);
+        reject({ message: error.message, stderr: stderr || '', stdout: stdout || '' });
       } else {
+        console.log('✅ stdout (primeiros 200 chars):', stdout.slice(0, 200));
         resolve(stdout.trim());
       }
     });
   });
 }
 
-// Rota de health check
-app.get('/', async (req, res) => {
-  const exists = fs.existsSync(YTDLP_PATH);
-  let version = null;
-  if (exists) {
-    try {
-      version = await execYtDlp(['--version'], 10000);
-    } catch (e) {
-      version = 'error: ' + e.message;
-    }
-  }
-  res.json({
-    status: 'ok',
-    ytdlp_exists: exists,
-    ytdlp_version: version,
-    message: 'Vidown API (yt-dlp) is running'
-  });
-});
-
-// Endpoint de teste rápido
-app.get('/test', async (req, res) => {
+// ------------------------------------------------------------
+// ENDPOINT DE DEBUG – testa o yt-dlp com um vídeo real
+// ------------------------------------------------------------
+app.get('/debug', async (req, res) => {
+  const testUrl = 'https://www.youtube.com/watch?v=aqz-KE-bpBQ';
   try {
-    const output = await execYtDlp(['--version'], 10000);
-    res.json({ status: 'ok', version: output });
-  } catch (e) {
-    res.status(500).json({ status: 'error', text: e.message });
+    const stdout = await execYtDlp([
+      '--dump-json',
+      '--no-playlist',
+      '--no-check-certificates',
+      '--geo-bypass',
+      '--simulate',
+      '--print', 'title',
+      testUrl
+    ], 120000);
+    res.json({ status: 'ok', title: stdout });
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      message: err.message,
+      stderr: err.stderr,
+      stdout: err.stdout
+    });
   }
 });
 
-// Endpoint de download
+// ------------------------------------------------------------
+// ENDPOINT DE DOWNLOAD
+// ------------------------------------------------------------
 app.post('/download', async (req, res) => {
   const { url, isAudioOnly, quality } = req.body;
 
@@ -93,7 +99,7 @@ app.post('/download', async (req, res) => {
   }
 
   try {
-    // Primeiro tenta obter informações (já valida se o vídeo existe)
+    // 1. Obter info do vídeo
     const infoOutput = await execYtDlp([
       '--dump-json',
       '--no-playlist',
@@ -104,16 +110,16 @@ app.post('/download', async (req, res) => {
     const info = JSON.parse(infoOutput);
     const title = info.title || 'video';
 
-    // Define o formato com fallback
+    // 2. Definir formato
     let formatArg;
     if (isAudioOnly) {
       formatArg = 'bestaudio[ext=m4a]/bestaudio/best';
     } else {
       const height = quality || 1080;
-      // Tenta o formato específico, depois o best geral
       formatArg = `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`;
     }
 
+    // 3. Obter URL do stream (com fallback)
     let streamUrl;
     try {
       streamUrl = await execYtDlp([
@@ -126,8 +132,7 @@ app.post('/download', async (req, res) => {
         url
       ]);
     } catch (formatError) {
-      // Se falhar com o formato específico, tenta com best
-      console.warn('Formato específico falhou, tentando best...');
+      console.warn('⚠️ Formato específico falhou, tentando best...');
       streamUrl = await execYtDlp([
         '-f', 'best',
         '-g',
@@ -146,31 +151,57 @@ app.post('/download', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Erro completo:', error);
+    // Retorna o erro completo para diagnóstico
+    console.error('❌ Download error:', error);
     res.status(500).json({
       status: 'error',
-      text: 'Failed to process video. ' + error.message.slice(0, 300)
+      text: 'Failed to process video.',
+      detail: error.stderr || error.message,
+      hint: 'If you see "HTTP Error 403" or "Sign in", the video might be restricted. Try another video.'
     });
   }
 });
 
-// Inicialização
+// ------------------------------------------------------------
+// HEALTH CHECK
+// ------------------------------------------------------------
+app.get('/', async (req, res) => {
+  const exists = fs.existsSync(YTDLP_PATH);
+  let version = null;
+  if (exists) {
+    try {
+      version = await execYtDlp(['--version'], 15000);
+    } catch (e) {
+      version = 'error: ' + e.message;
+    }
+  }
+  res.json({
+    status: 'ok',
+    ytdlp_exists: exists,
+    ytdlp_version: version,
+    message: 'Vidown API (yt-dlp) is running'
+  });
+});
+
+// ------------------------------------------------------------
+// INICIALIZAÇÃO
+// ------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 
 async function start() {
   if (!fs.existsSync(YTDLP_PATH)) {
-    console.log('Baixando yt-dlp...');
+    console.log('⬇️ Baixando yt-dlp...');
     try {
       await downloadYtDlp();
     } catch (error) {
       console.error('Falha ao baixar yt-dlp:', error);
     }
   } else {
-    console.log('yt-dlp já existe');
+    console.log('✅ yt-dlp já existe');
   }
 
   app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
   });
 }
 
